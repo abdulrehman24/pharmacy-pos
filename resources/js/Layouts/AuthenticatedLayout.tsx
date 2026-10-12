@@ -22,9 +22,25 @@ import {
     CheckCircle2,
     AlertCircle,
     Keyboard,
-    Activity
+    Activity,
+    UserCheck,
+    KeyRound,
+    User,
 } from 'lucide-react';
 import { PageProps } from '@/types';
+
+interface NavItem {
+    name: string;
+    href: string;
+    icon: any;
+    highlight?: boolean;
+    roles?: string[];
+}
+
+interface NavGroup {
+    title: string;
+    items: NavItem[];
+}
 
 export default function Authenticated({
     header,
@@ -80,7 +96,10 @@ export default function Authenticated({
         return () => window.removeEventListener('keydown', handleKeyDown);
     }, []);
 
-    const navGroups = [
+    const userRole = user?.role || 'cashier';
+    const isAdmin = userRole === 'admin';
+
+    const navGroups: NavGroup[] = [
         {
             title: 'Operations',
             items: [
@@ -94,29 +113,48 @@ export default function Authenticated({
             title: 'Inventory & Catalogue',
             items: [
                 { name: 'Medicines', href: route('medicines.index'), icon: Pill },
-                { name: 'Purchases (Receiving)', href: route('purchases.index'), icon: Truck },
+                { name: 'Purchases (Receiving)', href: route('purchases.index'), icon: Truck, roles: ['admin', 'manager', 'pharmacist', 'inventory'] },
                 { name: 'Batches & Stock Lots', href: route('inventory.index'), icon: Boxes },
-                { name: 'Stock Movement Ledger', href: route('inventory.ledger'), icon: FileSpreadsheet },
-                { name: 'Physical Stock Audits', href: route('inventory.counts'), icon: Activity },
+                { name: 'Stock Movement Ledger', href: route('inventory.ledger'), icon: FileSpreadsheet, roles: ['admin', 'manager', 'pharmacist', 'inventory'] },
+                { name: 'Physical Stock Audits', href: route('inventory.counts'), icon: Activity, roles: ['admin', 'manager', 'pharmacist'] },
             ],
         },
         {
             title: 'Accounts & Ledgers',
             items: [
                 { name: 'Customers (Khata)', href: route('customers.index'), icon: Users },
-                { name: 'Suppliers Ledger', href: route('suppliers.index'), icon: Building2 },
-                { name: 'Operating Expenses', href: route('expenses.index'), icon: ReceiptText },
+                { name: 'Suppliers Ledger', href: route('suppliers.index'), icon: Building2, roles: ['admin', 'manager', 'pharmacist', 'accounts'] },
+                { name: 'Operating Expenses', href: route('expenses.index'), icon: ReceiptText, roles: ['admin', 'manager', 'cashier', 'accounts'] },
             ],
         },
         {
             title: 'Administration',
             items: [
                 { name: 'Prescriptions (Rx)', href: route('prescriptions.index'), icon: FileSignature },
-                { name: 'Reports & Margins', href: route('reports.index'), icon: BarChart3 },
-                { name: 'Settings & Backups', href: route('settings.index'), icon: Settings },
+                { name: 'Reports & Margins', href: route('reports.index'), icon: BarChart3, roles: ['admin', 'manager'] },
+                { name: 'Settings & Backups', href: route('settings.index'), icon: Settings, roles: ['admin'] },
+            ],
+        },
+        {
+            title: 'Account & Security',
+            items: [
+                { name: 'My Profile & PIN', href: route('profile.edit'), icon: UserCheck },
             ],
         },
     ];
+
+    const hasAccess = (item: NavItem): boolean => {
+        if (isAdmin) return true;
+        if (!item.roles || item.roles.length === 0) return true;
+        return item.roles.includes(userRole);
+    };
+
+    const filteredNavGroups = navGroups
+        .map((group) => ({
+            ...group,
+            items: group.items.filter(hasAccess),
+        }))
+        .filter((group) => group.items.length > 0);
 
     return (
         <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col antialiased">
@@ -174,12 +212,32 @@ export default function Authenticated({
                         <kbd className="hidden lg:inline-block rounded bg-emerald-800/80 px-1.5 py-0.5 text-[10px] font-mono">F1</kbd>
                     </Link>
 
-                    {/* User Profile */}
-                    <div className="flex items-center gap-2 border-l border-slate-800/80 pl-2 sm:pl-3">
-                        <div className="text-right hidden sm:block">
-                            <div className="text-xs font-semibold text-slate-200">{user.name}</div>
-                            <div className="text-[11px] font-bold capitalize text-emerald-400">{user.role}</div>
-                        </div>
+                    {/* User Profile & Settings */}
+                    <div className="flex items-center gap-1.5 sm:gap-2 border-l border-slate-800/80 pl-2 sm:pl-3">
+                        <Link
+                            href={route('profile.edit')}
+                            className="flex items-center gap-2 px-2 py-1 rounded-xl hover:bg-slate-800/60 transition group text-right"
+                            title="My Profile & Security Settings"
+                        >
+                            <div className="h-8 w-8 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 flex items-center justify-center font-bold text-xs group-hover:border-emerald-500/50 group-hover:scale-105 transition">
+                                {user.name ? user.name.slice(0, 2).toUpperCase() : 'U'}
+                            </div>
+                            <div className="hidden sm:block">
+                                <div className="text-xs font-semibold text-slate-200 group-hover:text-white transition">
+                                    {user.name}
+                                </div>
+                                <div className="text-[10px] font-bold uppercase tracking-wider text-emerald-400">{user.role}</div>
+                            </div>
+                        </Link>
+
+                        <Link
+                            href={route('profile.edit')}
+                            className="rounded-xl p-2 text-slate-400 hover:bg-slate-800 hover:text-emerald-400 transition"
+                            title="User Settings (PIN, Password, Profile)"
+                        >
+                            <Settings className="h-4 w-4" />
+                        </Link>
+
                         <Link
                             href={route('logout')}
                             method="post"
@@ -232,7 +290,7 @@ export default function Authenticated({
                 >
                     <div className="flex h-full flex-col justify-between overflow-y-auto px-3 py-4 space-y-4">
                         <nav className="space-y-4">
-                            {navGroups.map((group, gIdx) => (
+                            {filteredNavGroups.map((group, gIdx) => (
                                 <div key={gIdx} className="space-y-1">
                                     <div className="px-3 text-[10px] font-bold uppercase tracking-wider text-slate-500">
                                         {group.title}

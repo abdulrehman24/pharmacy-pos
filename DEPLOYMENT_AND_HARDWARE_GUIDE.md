@@ -222,32 +222,46 @@ To guarantee tight financial controls and detect till leakage:
 
 ## 6. Backup, Disaster Recovery & High-Availability
 
-### 6.1 Instant Manual Database Backup
+### 6.1 Instant Manual System Backup
 - Managers or administrators can navigate to **Settings -> Database Backups** (`/settings`) and click **"Generate Database Backup Now"**.
-- A compressed `.sql` snapshot of the entire database schema and data is written directly to `storage/app/backups/`.
+- An authoritative, verified system archive (`.zip`) containing a `--single-transaction` InnoDB database dump, all uploaded prescription attachments, and a SHA-256 verified `manifest.json` is written directly to `storage/app/backups/`.
+- Cashiers and unauthorized roles are strictly forbidden from creating, downloading, or restoring backups.
 
-### 6.2 Automated Nightly Backup Script (Windows)
-Create a batch script `C:\scripts\backup_pharmacy_pos.bat`:
+### 6.2 Automated Nightly Backup (Scheduler & Script)
+The system schedules automated nightly backups via Laravel's console schedule:
+```bash
+# Handled automatically via routes/console.php at 02:00 AM:
+php artisan app:backup
+```
+Alternatively, for standalone Windows server environments without continuous cron daemon, create `C:\scripts\backup_pharmacy_pos.bat`:
 ```bat
 @echo off
-set TIMESTAMP=%date:~10,4%-%date:~4,2%-%date:~7,2%_%time:~0,2%-%time:~3,2%
-set BACKUP_DIR=D:\PharmacyBackups
-mkdir %BACKUP_DIR% 2>nul
+setlocal
+cd /d "C:\pharmacy_pos"
 
-"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqldump.exe" -u pharmacy_user -pYourPassword pharmacy_pos > "%BACKUP_DIR%\pharmacy_pos_%TIMESTAMP%.sql"
+:: Execute authoritative backup artisan command
+php artisan app:backup
+if %ERRORLEVEL% neq 0 (
+    echo [ERROR] Backup failed with exit code %ERRORLEVEL% >> storage\logs\backup.log
+    exit /b %ERRORLEVEL%
+)
 
-echo Backup completed: %BACKUP_DIR%\pharmacy_pos_%TIMESTAMP%.sql
+echo [SUCCESS] Backup completed successfully >> storage\logs\backup.log
+exit /b 0
 ```
-Schedule this script in **Windows Task Scheduler** to run daily at 02:00 AM. Always keep a secondary copy on an external USB flash drive.
+Schedule this script in **Windows Task Scheduler** to run daily at 02:00 AM. Always replicate backups to an external USB flash drive or secondary machine.
 
 ### 6.3 Disaster Recovery / Cold Restore
-To restore on a new computer:
+To restore on a replacement workstation or server:
+1. Log in as an Administrator, navigate to **Settings -> Backups** (`/settings`), and select **Restore** on the target backup snapshot. The system automatically creates a safety pre-restore backup, verifies archive integrity and SHA-256 hashes against `manifest.json`, restores database tables, and unzips prescription attachments.
+2. For command-line disaster recovery:
 ```bash
-# 1. Create a fresh database
-mysql -u root -p -e "CREATE DATABASE pharmacy_pos CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+# 1. Unzip the backup archive
+unzip backup_2026-10-12_xxxx.zip -d /tmp/restore_pkg/
 
-# 2. Import the backup file
-mysql -u root -p pharmacy_pos < "D:\PharmacyBackups\pharmacy_pos_latest.sql"
+# 2. Verify manifest checksums and import database
+mysql -u root -p pharmacy_pos < /tmp/restore_pkg/database.sql
 
-# 3. Ensure .env has the original APP_KEY and start the web server
+# 3. Restore prescription attachments
+cp -r /tmp/restore_pkg/attachments/* storage/app/
 ```

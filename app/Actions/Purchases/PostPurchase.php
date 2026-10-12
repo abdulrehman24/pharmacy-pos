@@ -6,7 +6,9 @@ use App\Models\Medicine;
 use App\Models\MedicinePackage;
 use App\Models\Purchase;
 use App\Models\PurchaseLine;
+use App\Models\Shift;
 use App\Models\Supplier;
+use App\Models\SupplierPayment;
 use App\Models\User;
 use App\Services\InventoryService;
 use Illuminate\Support\Facades\DB;
@@ -54,13 +56,20 @@ class PostPurchase
             $payload
         ) {
             $subtotalPaisa = 0;
-            $processedLines = [];
+            $preparedLines = [];
 
+            // Step 1: Validate lines and calculate gross subtotal
             foreach ($linesData as $item) {
                 $medicine = Medicine::findOrFail($item['medicine_id']);
-                $package = isset($item['medicine_package_id']) && $item['medicine_package_id']
-                    ? MedicinePackage::findOrFail($item['medicine_package_id'])
-                    : null;
+                $package = null;
+                if (!empty($item['medicine_package_id'])) {
+                    $package = MedicinePackage::where('id', $item['medicine_package_id'])
+                        ->where('medicine_id', $medicine->id)
+                        ->first();
+                    if (!$package) {
+                        throw new InvalidArgumentException("Package does not belong to medicine {$medicine->brand_name}.");
+                    }
+                }
 
                 $conversionFactor = $package ? $package->base_quantity : 1;
                 $packageQty = (int) ($item['package_quantity'] ?? 1);
@@ -74,25 +83,40 @@ class PostPurchase
                 $totalBaseQty = ($packageQty * $conversionFactor) + $bonusBaseQty;
                 $lineTotalCostPaisa = $packageQty * $packageCostPaisa;
 
-                // Effective unit cost per base unit (accounting for bonus stock)
-                $unitCostPaisa = $totalBaseQty > 0
-                    ? $lineTotalCostPaisa / $totalBaseQty
-                    : 0.0;
-
                 $subtotalPaisa += $lineTotalCostPaisa;
 
-                $processedLines[] = [
-                    'medicine_id' => $medicine->id,
-                    'medicine_package_id' => $package?->id,
+                $preparedLines[] = [
+                    'medicine' => $medicine,
+                    'package' => $package,
                     'batch_number' => trim($item['batch_number']),
                     'expiry_date' => $item['expiry_date'],
                     'package_quantity' => $packageQty,
                     'bonus_base_quantity' => $bonusBaseQty,
                     'total_base_quantity' => $totalBaseQty,
                     'package_cost_paisa' => $packageCostPaisa,
-                    'unit_cost_paisa' => $unitCostPaisa,
-                    'total_cost_paisa' => $lineTotalCostPaisa,
+                    'line_total_cost_paisa' => $lineTotalCostPaisa,
                 ];
+            }
+
+            // Step 2: Allocate invoice discount proportionally across lines for accurate stock valuation (A15)
+            $processedLines = [];
+            foreach ($preparedLines as $p) {
+                $lineDiscount = 0;
+                if ($subtotalPaisa > 0 && $discountPaisa > 0) {
+                    $lineDiscount = (int) round(($p['line_total_cost_paisa'] / $subtotalPaisa) * $discountPaisa);
+                }
+                $netLineCostPaisa = max(0, $p['line_total_cost_paisa'] - $lineDiscount);
+
+                // Effective net unit cost per base unit
+                $unitCostPaisa = $p['total_base_quantity'] > 0
+                    ? $netLineCostPaisa / $p['total_base_quantity']
+                    : 0.0;
+
+                $processedLines[] = array_merge($p, [
+                    'discount_paisa' => $lineDiscount,
+                    'net_line_cost_paisa' => $netLineCostPaisa,
+                    'unit_cost_paisa' => $unitCostPaisa,
+                ]);
             }
 
             $totalPaisa = max(0, $subtotalPaisa - $discountPaisa + $taxPaisa);
@@ -114,10 +138,10 @@ class PostPurchase
             ]);
 
             foreach ($processedLines as $pLine) {
-                PurchaseLine::create([
+                $purchaseLine = PurchaseLine::create([
                     'purchase_id' => $purchase->id,
-                    'medicine_id' => $pLine['medicine_id'],
-                    'medicine_package_id' => $pLine['medicine_package_id'],
+                    'medicine_id' => $pLine['medicine']->id,
+                    'medicine_package_id' => $pLine['package']?->id,
                     'batch_number' => $pLine['batch_number'],
                     'expiry_date' => $pLine['expiry_date'],
                     'package_quantity' => $pLine['package_quantity'],
@@ -125,12 +149,12 @@ class PostPurchase
                     'total_base_quantity' => $pLine['total_base_quantity'],
                     'package_cost_paisa' => $pLine['package_cost_paisa'],
                     'unit_cost_paisa' => $pLine['unit_cost_paisa'],
-                    'total_cost_paisa' => $pLine['total_cost_paisa'],
+                    'total_cost_paisa' => $pLine['line_total_cost_paisa'],
                 ]);
 
-                // Post stock & create lot
+                // Post stock & create lot with net cost and purchase reference (A15)
                 $this->inventoryService->receiveStock(
-                    $pLine['medicine_id'],
+                    $pLine['medicine']->id,
                     $pLine['batch_number'],
                     $pLine['expiry_date'],
                     $pLine['total_base_quantity'],
@@ -138,8 +162,23 @@ class PostPurchase
                     $locationId,
                     $user->id,
                     $invoiceNumber,
-                    "Purchase {$invoiceNumber}"
+                    "Purchase {$invoiceNumber}",
+                    $purchase->id
                 );
+            }
+
+            // Upfront cash payment links to open shift if cashier has an open shift (A11)
+            if ($paidPaisa > 0) {
+                $openShift = Shift::where('user_id', $user->id)->where('status', 'open')->latest()->first();
+                SupplierPayment::create([
+                    'supplier_id' => $supplier->id,
+                    'user_id' => $user->id,
+                    'shift_id' => $openShift?->id,
+                    'amount_paisa' => $paidPaisa,
+                    'payment_method' => $paymentMethod,
+                    'reference' => $invoiceNumber,
+                    'notes' => "Upfront payment on purchase {$invoiceNumber}",
+                ]);
             }
 
             // Update Supplier Balance: Net unpaid balance increases supplier payable

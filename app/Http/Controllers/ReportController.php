@@ -9,6 +9,7 @@ use App\Models\Sale;
 use App\Models\SaleAllocation;
 use App\Models\SaleLine;
 use App\Models\SalesReturn;
+use App\Models\SalesReturnLine;
 use App\Models\Shift;
 use App\Models\StockLot;
 use Carbon\Carbon;
@@ -41,12 +42,25 @@ class ReportController extends Controller
         $returnsPaisa = (int) $returns->sum('total_refund_paisa');
         $netSalesPaisa = $totalSalesPaisa - $returnsPaisa;
 
-        // True COGS for period
+        // True COGS for period (subtracting returned stock COGS)
         $allocations = SaleAllocation::whereIn('sale_id', $sales->pluck('id'))->get();
-        $cogsPaisa = (int) round($allocations->sum(function ($alloc) {
+        $grossCogsPaisa = (int) round($allocations->sum(function ($alloc) {
             return $alloc->base_quantity * (float) $alloc->cost_per_base_unit_paisa;
         }));
-        $grossMarginPaisa = max(0, ($netSalesPaisa - $taxPaisa) - $cogsPaisa);
+
+        $returnedStockCostPaisa = (int) round(
+            SalesReturnLine::whereIn('sales_return_id', $returns->pluck('id'))
+                ->where('disposition', 'restock')
+                ->whereNotNull('stock_lot_id')
+                ->with('stockLot')
+                ->get()
+                ->sum(function ($rLine) {
+                    $costPerBaseUnit = $rLine->stockLot ? (float) $rLine->stockLot->cost_per_base_unit : 0.0;
+                    return $rLine->base_quantity * ($costPerBaseUnit * 100);
+                })
+        );
+        $cogsPaisa = max(0, $grossCogsPaisa - $returnedStockCostPaisa);
+        $grossMarginPaisa = ($netSalesPaisa - $taxPaisa) - $cogsPaisa;
 
         // Payment method breakdown
         $paymentMethods = [
@@ -58,10 +72,10 @@ class ReportController extends Controller
             'credit' => (int) $sales->where('payment_method', 'credit')->sum('total_paisa'),
         ];
 
-        // 2. Top medicines by revenue & margin
-        $itemSales = SaleLine::selectRaw('medicine_name, SUM(quantity) as total_qty, SUM(total_paisa) as total_revenue_paisa')
+        // 2. Top medicines by revenue & margin (group by medicine_id and sum base quantity)
+        $itemSales = SaleLine::selectRaw('medicine_id, medicine_name, SUM(total_base_quantity) as total_qty, SUM(total_paisa) as total_revenue_paisa')
             ->whereIn('sale_id', $sales->pluck('id'))
-            ->groupBy('medicine_name')
+            ->groupBy('medicine_id', 'medicine_name')
             ->orderByDesc('total_revenue_paisa')
             ->take(10)
             ->get();

@@ -93,28 +93,29 @@ class InventoryService
         int $locationId,
         int $userId,
         string $receiptReference,
-        ?string $notes = null
+        ?string $notes = null,
+        ?int $referenceId = null
     ): StockLot {
         if ($receivedBaseQty <= 0) {
             throw new InvalidArgumentException("Received quantity must be positive.");
         }
 
-        // 1. Find or create Batch
-        $batch = Batch::firstOrCreate(
-            [
+        // 1. Find or create Batch with strict expiry consistency check (A14)
+        $batch = Batch::where('medicine_id', $medicineId)
+            ->where('batch_number', trim($batchNumber))
+            ->first();
+
+        if ($batch) {
+            if ($batch->expiry_date->format('Y-m-d') !== $expiryDate) {
+                throw new InvalidArgumentException("Batch {$batchNumber} already exists for this medicine with a different expiry date ({$batch->expiry_date->format('Y-m-d')}). Inconsistent expiry dates are not allowed.");
+            }
+        } else {
+            $batch = Batch::create([
                 'medicine_id' => $medicineId,
                 'batch_number' => trim($batchNumber),
-            ],
-            [
                 'expiry_date' => $expiryDate,
                 'status' => 'sellable',
-            ]
-        );
-
-        // Update expiry date if previously unset or different
-        if ($batch->expiry_date->format('Y-m-d') !== $expiryDate) {
-            $batch->expiry_date = $expiryDate;
-            $batch->save();
+            ]);
         }
 
         $costInRupees = $unitCostPaisa / 100;
@@ -138,7 +139,7 @@ class InventoryService
             'location_id' => $locationId,
             'movement_type' => 'purchase',
             'reference_type' => 'Purchase',
-            'reference_id' => $stockLot->id,
+            'reference_id' => $referenceId ?? $stockLot->id,
             'quantity_base_unit' => $receivedBaseQty,
             'cost_per_base_unit' => $costInRupees,
             'user_id' => $userId,
@@ -189,10 +190,10 @@ class InventoryService
                 'movement_type' => 'adjustment',
                 'reference_type' => 'SalesReturn',
                 'reference_id' => $salesReturnId,
-                'quantity_base_unit' => 0, // Held in quarantine, not added to sellable stock
+                'quantity_base_unit' => $baseQty, // Record physical quantity returned to quarantine
                 'cost_per_base_unit' => $lot->cost_per_base_unit,
                 'user_id' => $userId,
-                'notes' => "Placed in quarantine after return",
+                'notes' => $notes ?? "Placed in quarantine after return",
                 'created_at' => now(),
             ]);
         } else {
@@ -205,10 +206,10 @@ class InventoryService
                 'movement_type' => 'write_off',
                 'reference_type' => 'SalesReturn',
                 'reference_id' => $salesReturnId,
-                'quantity_base_unit' => 0,
+                'quantity_base_unit' => $baseQty, // Record physical quantity written off
                 'cost_per_base_unit' => $lot->cost_per_base_unit,
                 'user_id' => $userId,
-                'notes' => "Written off upon customer return",
+                'notes' => $notes ?? "Written off upon customer return",
                 'created_at' => now(),
             ]);
         }

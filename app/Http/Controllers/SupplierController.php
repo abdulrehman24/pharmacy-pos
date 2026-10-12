@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Purchase;
 use App\Models\Shift;
 use App\Models\Supplier;
 use App\Models\SupplierPayment;
@@ -82,21 +83,39 @@ class SupplierController extends Controller
             'notes' => ['nullable', 'string', 'max:500'],
         ]);
 
-        $openShift = Shift::where('status', 'open')->latest()->first();
+        $user = $request->user();
+        $openShift = Shift::where('user_id', $user->id)->where('status', 'open')->latest()->first();
 
-        DB::transaction(function () use ($validated, $supplier, $request, $openShift) {
+        DB::transaction(function () use ($validated, $supplier, $user, $openShift) {
             SupplierPayment::create([
                 'supplier_id' => $supplier->id,
-                'user_id' => $request->user()->id,
+                'user_id' => $user->id,
                 'shift_id' => $openShift?->id,
                 'amount_paisa' => $validated['amount_paisa'],
                 'payment_method' => $validated['payment_method'],
-                'reference' => $validated['reference'],
-                'notes' => $validated['notes'],
+                'reference' => $validated['reference'] ?? null,
+                'notes' => $validated['notes'] ?? null,
             ]);
 
             // Decrement liability balance
             $supplier->decrement('balance_paisa', $validated['amount_paisa']);
+
+            // Allocate payment FIFO across unpaid purchases (A16)
+            $unpaidPurchases = Purchase::where('supplier_id', $supplier->id)
+                ->where('status', 'posted')
+                ->whereRaw('total_paisa > paid_paisa')
+                ->orderBy('invoice_date', 'asc')
+                ->lockForUpdate()
+                ->get();
+
+            $remaining = (int) $validated['amount_paisa'];
+            foreach ($unpaidPurchases as $purchase) {
+                if ($remaining <= 0) break;
+                $due = (int) ($purchase->total_paisa - $purchase->paid_paisa);
+                $alloc = min($remaining, $due);
+                $purchase->increment('paid_paisa', $alloc);
+                $remaining -= $alloc;
+            }
         });
 
         return back()->with('success', 'Payment recorded and supplier balance updated.');

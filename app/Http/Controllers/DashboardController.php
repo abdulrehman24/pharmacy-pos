@@ -47,24 +47,43 @@ class DashboardController extends Controller
         $digitalCollectionsPaisa = (int) $todaySales->whereIn('payment_method', ['jazzcash', 'easypaisa', 'bank_transfer'])->sum('total_paisa');
         $creditSalesPaisa = (int) $todaySales->where('payment_method', 'credit')->sum('total_paisa');
 
-        // True Cost of Goods Sold for today's sales
+        // True Cost of Goods Sold for today's sales (subtracting returned stock COGS)
         $todayAllocations = \App\Models\SaleAllocation::whereIn('sale_id', $todaySales->pluck('id'))->get();
-        $cogsPaisa = (int) round($todayAllocations->sum(function ($alloc) {
+        $grossCogsPaisa = (int) round($todayAllocations->sum(function ($alloc) {
             return $alloc->base_quantity * (float) $alloc->cost_per_base_unit_paisa;
         }));
 
-        $grossMarginPaisa = max(0, ($netSalesPaisa - $taxPaisa) - $cogsPaisa);
+        $todayReturnedStockCostPaisa = (int) round(
+            \App\Models\SalesReturnLine::whereIn('sales_return_id', $todayReturns->pluck('id'))
+                ->where('disposition', 'restock')
+                ->whereNotNull('stock_lot_id')
+                ->with('stockLot')
+                ->get()
+                ->sum(function ($rLine) {
+                    $costPerBaseUnit = $rLine->stockLot ? (float) $rLine->stockLot->cost_per_base_unit : 0.0;
+                    return $rLine->base_quantity * ($costPerBaseUnit * 100);
+                })
+        );
+        $cogsPaisa = max(0, $grossCogsPaisa - $todayReturnedStockCostPaisa);
+
+        $grossMarginPaisa = ($netSalesPaisa - $taxPaisa) - $cogsPaisa;
 
         // Customer outstanding total & Supplier payable total
         $totalCustomerReceivablesPaisa = (int) Customer::where('balance_paisa', '>', 0)->sum('balance_paisa');
         $totalSupplierPayablesPaisa = (int) Supplier::where('balance_paisa', '>', 0)->sum('balance_paisa');
 
-        // Low stock medicines
+        // Low stock medicines (Optimized aggregate query for scale)
+        $todayStr = $today->toDateString();
         $lowStockMedicines = Medicine::where('is_active', true)
+            ->withSum([
+                'stockLots as current_stock' => function ($query) use ($todayStr) {
+                    $query->whereHas('batch', fn($b) => $b->where('status', 'sellable')->where('expiry_date', '>=', $todayStr));
+                }
+            ], 'remaining_base_qty')
             ->get()
-            ->filter(function ($med) {
-                return $med->totalSellableStockBaseUnit() <= $med->reorder_level;
-            })
+            ->filter(fn($med) => (int) ($med->current_stock ?? 0) <= $med->reorder_level)
+            ->take(8)
+            ->values()
             ->map(function ($med) {
                 return [
                     'id' => $med->id,
@@ -74,30 +93,28 @@ class DashboardController extends Controller
                     'strength' => $med->strength,
                     'base_unit' => $med->base_unit,
                     'reorder_level' => $med->reorder_level,
-                    'current_stock' => $med->totalSellableStockBaseUnit(),
+                    'current_stock' => (int) ($med->current_stock ?? 0),
                     'rack_shelf' => $med->rack_shelf,
                 ];
-            })
-            ->values()
-            ->take(8);
+            });
 
-        // Medicines expiring within alert threshold
+        // Medicines expiring within alert threshold (Aggregated)
         $expiringBatches = Batch::with('medicine')
             ->where('status', 'sellable')
             ->whereDate('expiry_date', '<=', $expiryThreshold)
             ->whereHas('stockLots', fn($q) => $q->where('remaining_base_qty', '>', 0))
+            ->withSum('stockLots as remaining_base_qty', 'remaining_base_qty')
             ->orderBy('expiry_date', 'asc')
             ->take(8)
             ->get()
             ->map(function ($batch) {
-                $remaining = (int) $batch->stockLots()->sum('remaining_base_qty');
                 return [
                     'id' => $batch->id,
                     'medicine_name' => $batch->medicine->brand_name . ' ' . $batch->medicine->strength,
                     'batch_number' => $batch->batch_number,
                     'expiry_date' => $batch->expiry_date->format('d-M-Y'),
                     'is_expired' => $batch->expiry_date->isPast(),
-                    'remaining_base_qty' => $remaining,
+                    'remaining_base_qty' => (int) ($batch->remaining_base_qty ?? 0),
                     'base_unit' => $batch->medicine->base_unit,
                 ];
             });

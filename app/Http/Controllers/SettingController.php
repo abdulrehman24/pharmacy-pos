@@ -55,6 +55,10 @@ class SettingController extends Controller
             'default_paper_width' => ['required', 'integer', 'in:58,80'],
         ]);
 
+        if (! $request->user()?->isAdmin()) {
+            abort(403, 'Unauthorized. Modifying system settings requires administrator authorization.');
+        }
+
         foreach ($validated as $key => $value) {
             $type = in_array($key, ['tax_percentage', 'expiry_alert_days', 'default_paper_width'], true)
                 ? 'integer'
@@ -62,11 +66,23 @@ class SettingController extends Controller
             Setting::set($key, $value, 'general', $type);
         }
 
+        \App\Models\AuditEvent::log(
+            'settings_updated',
+            'Setting',
+            null,
+            null,
+            $validated
+        );
+
         return back()->with('success', 'Settings updated successfully.');
     }
 
     public function storePrinter(Request $request): RedirectResponse
     {
+        if (! $request->user()?->isAdmin()) {
+            abort(403, 'Unauthorized. Adding printer profiles requires administrator authorization.');
+        }
+
         $validated = $request->validate([
             'name' => ['required', 'string', 'max:50'],
             'connection_type' => ['required', 'string', 'in:browser,network,windows_raw'],
@@ -82,7 +98,7 @@ class SettingController extends Controller
             PrinterProfile::where('id', '>', 0)->update(['is_default' => false]);
         }
 
-        PrinterProfile::create([
+        $profile = PrinterProfile::create([
             'name' => $validated['name'],
             'connection_type' => $validated['connection_type'],
             'host' => $validated['host'] ?? null,
@@ -93,11 +109,23 @@ class SettingController extends Controller
             'is_default' => $validated['is_default'] ?? false,
         ]);
 
+        \App\Models\AuditEvent::log(
+            'printer_profile_created',
+            'PrinterProfile',
+            $profile->id,
+            null,
+            $validated
+        );
+
         return back()->with('success', 'Printer profile added successfully.');
     }
 
     public function storeUser(Request $request): RedirectResponse
     {
+        if (! $request->user()?->isAdmin()) {
+            abort(403, 'Unauthorized. Creating staff accounts requires administrator authorization.');
+        }
+
         $validated = $request->validate([
             'name' => ['required', 'string', 'max:255'],
             'email' => ['required', 'email', 'max:255', 'unique:users,email'],
@@ -107,7 +135,7 @@ class SettingController extends Controller
             'phone' => ['nullable', 'string', 'max:30'],
         ]);
 
-        User::create([
+        $newUser = User::create([
             'name' => $validated['name'],
             'email' => $validated['email'],
             'password' => Hash::make($validated['password']),
@@ -117,51 +145,32 @@ class SettingController extends Controller
             'is_active' => true,
         ]);
 
+        \App\Models\AuditEvent::log(
+            'user_created',
+            'User',
+            $newUser->id,
+            null,
+            ['name' => $newUser->name, 'email' => $newUser->email, 'role' => $newUser->role]
+        );
+
         return back()->with('success', "User {$validated['name']} registered.");
     }
 
     /**
      * Trigger local backup creation
      */
-    public function createBackup(Request $request): RedirectResponse
+    public function createBackup(Request $request, \App\Services\BackupService $backupService): RedirectResponse
     {
-        $dbName = config('database.connections.mysql.database');
-        $dbUser = config('database.connections.mysql.username');
-        $dbPass = config('database.connections.mysql.password');
-        $dbHost = config('database.connections.mysql.host');
-        $dbPort = config('database.connections.mysql.port', 3306);
-
-        $backupDir = storage_path('app/backups');
-        if (!is_dir($backupDir)) {
-            mkdir($backupDir, 0755, true);
+        if (! $request->user()?->isAdmin()) {
+            abort(403, 'Unauthorized. Creating database backups requires administrator authorization.');
         }
 
-        $fileName = 'backup_' . date('Y-m-d_His') . '.sql';
-        $filePath = $backupDir . '/' . $fileName;
-
-        $passArg = $dbPass ? "-p\"{$dbPass}\"" : '';
-        $cmd = "mysqldump -h {$dbHost} -P {$dbPort} -u {$dbUser} {$passArg} {$dbName} > \"{$filePath}\" 2>&1";
-
-        exec($cmd, $output, $returnCode);
-
-        $fileSize = file_exists($filePath) ? filesize($filePath) : 0;
-        $status = ($returnCode === 0 && $fileSize > 0) ? 'completed' : 'failed';
-        $errorMsg = ($status === 'failed') ? implode("\n", $output) : null;
-
-        BackupRun::create([
-            'file_name' => $fileName,
-            'file_path' => $filePath,
-            'file_size_bytes' => $fileSize,
-            'status' => $status,
-            'error_message' => $errorMsg,
-            'initiated_by' => $request->user()->id,
-        ]);
-
-        if ($status === 'completed') {
-            return back()->with('success', "Database backup created successfully ({$fileName}).");
+        try {
+            $backupRun = $backupService->createBackup($request->user()->id);
+            return back()->with('success', "Complete system backup created successfully ({$backupRun->file_name}).");
+        } catch (\Throwable $e) {
+            return back()->withErrors(['backup' => "Backup failed: {$e->getMessage()}"]);
         }
-
-        return back()->withErrors(['backup' => "Backup failed: {$errorMsg}"]);
     }
 
     /**
@@ -169,10 +178,37 @@ class SettingController extends Controller
      */
     public function downloadBackup(BackupRun $backupRun): BinaryFileResponse
     {
+        if (! auth()->user()?->isAdmin()) {
+            abort(403, 'Unauthorized. Downloading backups requires administrator authorization.');
+        }
+
         if (!file_exists($backupRun->file_path)) {
             abort(404, 'Backup file not found.');
         }
 
         return response()->download($backupRun->file_path, $backupRun->file_name);
+    }
+
+    /**
+     * Restore from a verified backup
+     */
+    public function restoreBackup(Request $request, \App\Services\BackupService $backupService): RedirectResponse
+    {
+        if (! $request->user()?->isAdmin()) {
+            abort(403, 'Unauthorized. Restoring backups requires administrator authorization.');
+        }
+
+        $validated = $request->validate([
+            'backup_id' => ['required', 'exists:backup_runs,id'],
+        ]);
+
+        $backupRun = BackupRun::findOrFail($validated['backup_id']);
+
+        try {
+            $backupService->restoreBackup($backupRun, $request->user()->id);
+            return back()->with('success', "Backup restored successfully ({$backupRun->file_name}).");
+        } catch (\Throwable $e) {
+            return back()->withErrors(['backup' => "Backup restore failed: {$e->getMessage()}"]);
+        }
     }
 }

@@ -65,7 +65,7 @@ export default function Receipt({ sale, shop, paperWidth = 80 }: Props) {
         setLanPrinting(true);
         setLanStatus(null);
         try {
-            const res = await axios.post(`/sales/${sale.number}/print`);
+            const res = await axios.post(`/sales/${sale.id}/print`);
             setLanStatus(res.data.message || 'LAN print job submitted.');
         } catch (err: any) {
             setLanStatus(err.response?.data?.message || 'Failed to communicate with LAN ESC/POS printer.');

@@ -61,6 +61,59 @@ class ProfileTest extends TestCase
         $this->assertNotNull($user->refresh()->email_verified_at);
     }
 
+    public function test_user_can_update_phone_number(): void
+    {
+        $user = User::factory()->create();
+
+        $response = $this
+            ->actingAs($user)
+            ->patch('/profile', [
+                'name' => 'Updated Name',
+                'email' => $user->email,
+                'phone' => '0300-9876543',
+            ]);
+
+        $response->assertSessionHasNoErrors()->assertRedirect('/profile');
+        $this->assertSame('0300-9876543', $user->refresh()->phone);
+    }
+
+    public function test_user_can_update_quick_pin(): void
+    {
+        $user = User::factory()->create();
+
+        $response = $this
+            ->actingAs($user)
+            ->put('/profile/pin', [
+                'pin_code' => '5678',
+            ]);
+
+        $response->assertSessionHasNoErrors()->assertRedirect('/profile');
+        $this->assertSame('5678', $user->refresh()->pin_code);
+    }
+
+    public function test_invalid_quick_pin_is_rejected(): void
+    {
+        $user = User::factory()->create();
+
+        // 3 digits
+        $response = $this
+            ->actingAs($user)
+            ->put('/profile/pin', [
+                'pin_code' => '123',
+            ]);
+
+        $response->assertSessionHasErrors(['pin_code']);
+
+        // non-digits
+        $response2 = $this
+            ->actingAs($user)
+            ->put('/profile/pin', [
+                'pin_code' => 'abcd',
+            ]);
+
+        $response2->assertSessionHasErrors(['pin_code']);
+    }
+
     public function test_user_can_delete_their_account(): void
     {
         $user = User::factory()->create();

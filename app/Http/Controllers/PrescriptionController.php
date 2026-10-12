@@ -95,7 +95,7 @@ class PrescriptionController extends Controller
             return back()->withErrors(['auth' => 'Only a licensed pharmacist or manager can verify prescriptions.']);
         }
 
-        $prescription->status = 'dispensed';
+        $prescription->status = 'verified';
         $prescription->verified_by = $user->id;
         $prescription->verified_at = now();
         $prescription->save();
@@ -109,5 +109,25 @@ class PrescriptionController extends Controller
         }
 
         return back()->with('success', "Prescription {$prescription->prescription_number} verified and approved.");
+    }
+
+    /**
+     * Authorized download of prescription attachment
+     */
+    public function downloadAttachment(PrescriptionAttachment $attachment): \Symfony\Component\HttpFoundation\BinaryFileResponse
+    {
+        $user = auth()->user();
+        if (! $user || (! $user->isPharmacist() && ! $user->isAdmin() && ! $user->isManager())) {
+            abort(403, 'Unauthorized. Viewing prescription attachments requires pharmacist or managerial authorization.');
+        }
+
+        if (! Storage::disk('local')->exists($attachment->file_path)) {
+            abort(404, 'Prescription attachment file not found.');
+        }
+
+        return response()->download(
+            Storage::disk('local')->path($attachment->file_path),
+            $attachment->file_name
+        );
     }
 }

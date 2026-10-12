@@ -78,6 +78,17 @@ class PurchaseController extends Controller
             'lines.*.package_cost_paisa' => ['required', 'integer', 'min:0'],
         ]);
 
+        foreach ($validated['lines'] as $index => $line) {
+            if (!empty($line['medicine_package_id'])) {
+                $pkgExists = \App\Models\MedicinePackage::where('id', $line['medicine_package_id'])
+                    ->where('medicine_id', $line['medicine_id'])
+                    ->exists();
+                if (!$pkgExists) {
+                    return back()->withErrors(["lines.{$index}.medicine_package_id" => "Selected package does not belong to the selected medicine."]);
+                }
+            }
+        }
+
         $purchase = $this->postPurchase->execute($validated, $request->user());
 
         return redirect()->route('purchases.show', $purchase->id)

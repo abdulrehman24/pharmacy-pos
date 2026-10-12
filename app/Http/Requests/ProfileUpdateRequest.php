@@ -26,6 +26,15 @@ class ProfileUpdateRequest extends FormRequest
                 'max:255',
                 Rule::unique(User::class)->ignore($this->user()->id),
             ],
+            'phone' => ['nullable', 'string', 'max:30'],
+            'pin_code' => ['nullable', 'string', 'regex:/^[0-9]{4}$/'],
+        ];
+    }
+
+    public function messages(): array
+    {
+        return [
+            'pin_code.regex' => 'The Quick PIN must be exactly 4 numeric digits (e.g. 1234).',
         ];
     }
 }

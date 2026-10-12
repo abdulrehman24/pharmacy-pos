@@ -61,9 +61,14 @@ class Shift extends Model
         return $this->hasMany(CustomerPayment::class);
     }
 
+    public function supplierPayments(): HasMany
+    {
+        return $this->hasMany(SupplierPayment::class);
+    }
+
     /**
      * Expected cash = opening float + cash sales + customer cash payments + cash in
-     *                 - cash returns - expenses - cash out
+     *                 - cash returns - expenses - cash out - supplier cash payments
      */
     public function calculateExpectedCashPaisa(): int
     {
@@ -78,9 +83,13 @@ class Shift extends Model
             })
             ->sum('received_paisa');
 
-        // Subtract change given out on sales
+        // Subtract change given out ONLY on cash/split sales (never on card or cashless transactions)
         $changeGiven = (int) $this->sales()
             ->where('status', 'posted')
+            ->where(function ($q) {
+                $q->where('payment_method', 'cash')
+                  ->orWhere('payment_method', 'split');
+            })
             ->sum('change_paisa');
 
         $netCashFromSales = $cashSales - $changeGiven;
@@ -108,6 +117,11 @@ class Shift extends Model
         // Expenses paid from drawer
         $expenses = (int) $this->expenses()->sum('amount_paisa');
 
-        return $opening + $netCashFromSales + $customerCashPayments + $cashIn - $cashReturns - $cashOut - $expenses;
+        // Supplier payments paid in cash from drawer
+        $supplierCashPayments = (int) $this->supplierPayments()
+            ->where('payment_method', 'cash')
+            ->sum('amount_paisa');
+
+        return $opening + $netCashFromSales + $customerCashPayments + $cashIn - $cashReturns - $cashOut - $expenses - $supplierCashPayments;
     }
 }

@@ -8,6 +8,7 @@ use App\Models\Expense;
 use App\Models\Shift;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Inertia\Inertia;
 use Inertia\Response;
 
@@ -49,10 +50,22 @@ class ShiftController extends Controller
 
         $user = $request->user();
 
+        // Counter must be active
+        $counter = Counter::where('id', $validated['counter_id'])->where('is_active', true)->first();
+        if (!$counter) {
+            return back()->withErrors(['counter_id' => 'The selected counter is inactive or unavailable.']);
+        }
+
         // Check if user already has an open shift
         $existing = Shift::where('user_id', $user->id)->where('status', 'open')->first();
         if ($existing) {
             return back()->withErrors(['shift' => 'You already have an active shift open. Please close it before opening a new one.']);
+        }
+
+        // Check if counter already has an open shift
+        $counterOpenShift = Shift::where('counter_id', $counter->id)->where('status', 'open')->first();
+        if ($counterOpenShift) {
+            return back()->withErrors(['shift' => 'This counter already has an active open shift.', 'counter_id' => 'This counter already has an active open shift.']);
         }
 
         Shift::create([
@@ -69,8 +82,11 @@ class ShiftController extends Controller
 
     public function close(Request $request, Shift $shift): RedirectResponse
     {
-        if ($shift->status !== 'open') {
-            return back()->withErrors(['shift' => 'Shift is already closed.']);
+        $user = $request->user();
+
+        // Enforce ownership: user must own the shift or be admin/manager
+        if ($shift->user_id !== $user->id && !$user->isAdmin() && !$user->isManager()) {
+            abort(403, 'Unauthorized to close another cashier\'s shift.');
         }
 
         $validated = $request->validate([
@@ -78,28 +94,45 @@ class ShiftController extends Controller
             'notes' => ['nullable', 'string', 'max:500'],
         ]);
 
-        $expectedCashPaisa = $shift->calculateExpectedCashPaisa();
         $countedCashPaisa = (int) $validated['counted_cash_paisa'];
-        $variancePaisa = $countedCashPaisa - $expectedCashPaisa;
+        $variancePaisa = 0;
 
-        $shift->closed_at = now();
-        $shift->counted_cash_paisa = $countedCashPaisa;
-        $shift->expected_cash_paisa = $expectedCashPaisa;
-        $shift->variance_paisa = $variancePaisa;
-        $shift->status = 'closed';
-        if (!empty($validated['notes'])) {
-            $shift->notes = ($shift->notes ? $shift->notes . " | " : '') . "Close note: " . $validated['notes'];
+        try {
+            DB::transaction(function () use ($shift, $validated, $countedCashPaisa, &$variancePaisa) {
+                $lockedShift = Shift::where('id', $shift->id)->lockForUpdate()->firstOrFail();
+
+                if ($lockedShift->status !== 'open') {
+                    throw new \InvalidArgumentException('Shift is already closed.');
+                }
+
+                $expectedCashPaisa = $lockedShift->calculateExpectedCashPaisa();
+                $variancePaisa = $countedCashPaisa - $expectedCashPaisa;
+
+                $lockedShift->closed_at = now();
+                $lockedShift->counted_cash_paisa = $countedCashPaisa;
+                $lockedShift->expected_cash_paisa = $expectedCashPaisa;
+                $lockedShift->variance_paisa = $variancePaisa;
+                $lockedShift->status = 'closed';
+                if (!empty($validated['notes'])) {
+                    $lockedShift->notes = ($lockedShift->notes ? $lockedShift->notes . ' | ' : '') . 'Close note: ' . $validated['notes'];
+                }
+                $lockedShift->save();
+            });
+        } catch (\InvalidArgumentException $e) {
+            return back()->withErrors(['shift' => $e->getMessage()]);
         }
-        $shift->save();
 
         return redirect()->route('shifts.index')
-            ->with('success', "Shift closed. Variance: PKR " . ($variancePaisa / 100));
+            ->with('success', 'Shift closed. Variance: PKR ' . ($variancePaisa / 100));
     }
 
     public function cashMovement(Request $request, Shift $shift): RedirectResponse
     {
-        if ($shift->status !== 'open') {
-            return back()->withErrors(['shift' => 'Cannot record cash movement on a closed shift.']);
+        $user = $request->user();
+
+        // Enforce ownership: user must own the shift or be admin/manager
+        if ($shift->user_id !== $user->id && !$user->isAdmin() && !$user->isManager()) {
+            abort(403, 'Unauthorized to record cash movement on another cashier\'s shift.');
         }
 
         $validated = $request->validate([
@@ -108,13 +141,25 @@ class ShiftController extends Controller
             'reason' => ['required', 'string', 'max:255'],
         ]);
 
-        CashMovement::create([
-            'shift_id' => $shift->id,
-            'user_id' => $request->user()->id,
-            'type' => $validated['type'],
-            'amount_paisa' => $validated['amount_paisa'],
-            'reason' => $validated['reason'],
-        ]);
+        try {
+            DB::transaction(function () use ($shift, $validated, $user) {
+                $lockedShift = Shift::where('id', $shift->id)->lockForUpdate()->firstOrFail();
+
+                if ($lockedShift->status !== 'open') {
+                    throw new \InvalidArgumentException('Cannot record cash movement on a closed shift.');
+                }
+
+                CashMovement::create([
+                    'shift_id' => $lockedShift->id,
+                    'user_id' => $user->id,
+                    'type' => $validated['type'],
+                    'amount_paisa' => $validated['amount_paisa'],
+                    'reason' => $validated['reason'],
+                ]);
+            });
+        } catch (\InvalidArgumentException $e) {
+            return back()->withErrors(['shift' => $e->getMessage()]);
+        }
 
         return back()->with('success', 'Cash movement logged successfully.');
     }

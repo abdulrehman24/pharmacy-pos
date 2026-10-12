@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\Customer;
 use App\Models\CustomerPayment;
+use App\Models\Sale;
 use App\Models\Shift;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -113,21 +114,45 @@ class CustomerController extends Controller
             'notes' => ['nullable', 'string', 'max:500'],
         ]);
 
-        $openShift = Shift::where('status', 'open')->latest()->first();
+        $user = $request->user();
+        $openShift = Shift::where('user_id', $user->id)->where('status', 'open')->latest()->first();
 
-        DB::transaction(function () use ($validated, $customer, $request, $openShift) {
+        DB::transaction(function () use ($validated, $customer, $user, $openShift) {
             CustomerPayment::create([
                 'customer_id' => $customer->id,
-                'user_id' => $request->user()->id,
+                'user_id' => $user->id,
                 'shift_id' => $openShift?->id,
                 'amount_paisa' => $validated['amount_paisa'],
                 'payment_method' => $validated['payment_method'],
-                'reference' => $validated['reference'],
-                'notes' => $validated['notes'],
+                'reference' => $validated['reference'] ?? null,
+                'notes' => $validated['notes'] ?? null,
             ]);
 
             // Decrement customer outstanding debt
             $customer->decrement('balance_paisa', $validated['amount_paisa']);
+
+            // Allocate payment FIFO across unpaid customer sales (A16)
+            $unpaidSales = Sale::where('customer_id', $customer->id)
+                ->where('status', 'posted')
+                ->where('balance_paisa', '>', 0)
+                ->orderBy('created_at', 'asc')
+                ->lockForUpdate()
+                ->get();
+
+            $remaining = (int) $validated['amount_paisa'];
+            foreach ($unpaidSales as $unpaidSale) {
+                if ($remaining <= 0) break;
+                $alloc = min($remaining, (int) $unpaidSale->balance_paisa);
+                $unpaidSale->decrement('balance_paisa', $alloc);
+                $unpaidSale->increment('received_paisa', $alloc);
+                if ($unpaidSale->fresh()->balance_paisa == 0) {
+                    $unpaidSale->payment_status = 'paid';
+                } else {
+                    $unpaidSale->payment_status = 'partial';
+                }
+                $unpaidSale->save();
+                $remaining -= $alloc;
+            }
         });
 
         return back()->with('success', 'Payment recorded and customer balance updated.');

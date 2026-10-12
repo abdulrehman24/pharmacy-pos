@@ -15,6 +15,7 @@ use App\Models\WriteOffLine;
 use Carbon\Carbon;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Inertia\Inertia;
 use Inertia\Response;
 
@@ -133,30 +134,35 @@ class InventoryController extends Controller
         $datePrefix = now()->format('Ymd');
         $countNumber = 'CNT-' . $datePrefix . '-' . strtoupper(bin2hex(random_bytes(3)));
 
-        $stockCount = StockCount::create([
-            'count_number' => $countNumber,
-            'location_id' => $validated['location_id'],
-            'status' => 'draft',
-            'conducted_by' => $request->user()->id,
-            'notes' => $validated['notes'],
-        ]);
-
-        foreach ($validated['lines'] as $line) {
-            $lot = StockLot::findOrFail($line['stock_lot_id']);
-            $variance = $line['counted_quantity'] - $line['system_quantity'];
-
-            StockCountLine::create([
-                'stock_count_id' => $stockCount->id,
-                'medicine_id' => $line['medicine_id'],
-                'batch_id' => $line['batch_id'],
-                'stock_lot_id' => $lot->id,
-                'system_quantity' => $line['system_quantity'],
-                'counted_quantity' => $line['counted_quantity'],
-                'variance_quantity' => $variance,
-                'cost_per_base_unit' => $lot->cost_per_base_unit,
-                'reason' => $line['reason'] ?? 'Physical audit',
+        DB::transaction(function () use ($validated, $countNumber, $request) {
+            $stockCount = StockCount::create([
+                'count_number' => $countNumber,
+                'location_id' => $validated['location_id'],
+                'status' => 'draft',
+                'conducted_by' => $request->user()->id,
+                'notes' => $validated['notes'] ?? null,
             ]);
-        }
+
+            foreach ($validated['lines'] as $line) {
+                $lot = StockLot::where('id', $line['stock_lot_id'])->lockForUpdate()->firstOrFail();
+                // Authoritative system quantity derived strictly server-side
+                $serverSystemQty = (int) $lot->remaining_base_qty;
+                $countedQty = (int) $line['counted_quantity'];
+                $variance = $countedQty - $serverSystemQty;
+
+                StockCountLine::create([
+                    'stock_count_id' => $stockCount->id,
+                    'medicine_id' => $lot->batch->medicine_id,
+                    'batch_id' => $lot->batch_id,
+                    'stock_lot_id' => $lot->id,
+                    'system_quantity' => $serverSystemQty,
+                    'counted_quantity' => $countedQty,
+                    'variance_quantity' => $variance,
+                    'cost_per_base_unit' => $lot->cost_per_base_unit,
+                    'reason' => $line['reason'] ?? 'Physical audit',
+                ]);
+            }
+        });
 
         return redirect()->route('inventory.counts')
             ->with('success', "Stock count {$countNumber} logged as draft. Awaiting manager approval.");
@@ -165,6 +171,14 @@ class InventoryController extends Controller
     public function approveCount(StockCount $stockCount, Request $request): RedirectResponse
     {
         $this->postAdjustment->execute($stockCount, $request->user());
+
+        \App\Models\AuditEvent::log(
+            'stock_count_approved',
+            'StockCount',
+            $stockCount->id,
+            ['status' => 'draft'],
+            ['status' => 'approved', 'count_number' => $stockCount->count_number]
+        );
 
         return redirect()->route('inventory.counts')
             ->with('success', "Stock count {$stockCount->count_number} approved and stock balances adjusted.");
@@ -182,54 +196,73 @@ class InventoryController extends Controller
             'reason' => ['required', 'string', 'max:500'],
         ]);
 
-        $lot = StockLot::with('batch.medicine')->findOrFail($validated['stock_lot_id']);
         $qty = $validated['quantity'];
 
-        if ($qty > $lot->remaining_base_qty) {
-            return back()->withErrors(['quantity' => "Cannot write off more than remaining quantity ({$lot->remaining_base_qty})."]);
+        try {
+            DB::transaction(function () use ($validated, $qty, $request) {
+                $lot = StockLot::with('batch.medicine')
+                    ->where('id', $validated['stock_lot_id'])
+                    ->lockForUpdate()
+                    ->firstOrFail();
+
+                if ($qty > $lot->remaining_base_qty) {
+                    throw new \InvalidArgumentException("Cannot write off more than remaining quantity ({$lot->remaining_base_qty}).");
+                }
+
+                $lossPaisa = (int) round($qty * ((float) $lot->cost_per_base_unit * 100));
+
+                $datePrefix = now()->format('Ymd');
+                $writeOffNumber = 'WO-' . $datePrefix . '-' . strtoupper(bin2hex(random_bytes(3)));
+
+                $writeOff = WriteOff::create([
+                    'write_off_number' => $writeOffNumber,
+                    'user_id' => $request->user()->id,
+                    'approved_by' => $request->user()->id,
+                    'total_loss_paisa' => $lossPaisa,
+                    'type' => $validated['type'],
+                    'reason' => $validated['reason'],
+                ]);
+
+                WriteOffLine::create([
+                    'write_off_id' => $writeOff->id,
+                    'stock_lot_id' => $lot->id,
+                    'medicine_id' => $lot->batch->medicine_id,
+                    'base_quantity' => $qty,
+                    'unit_cost_paisa' => (float) $lot->cost_per_base_unit * 100,
+                    'total_loss_paisa' => $lossPaisa,
+                ]);
+
+                $lot->decrement('remaining_base_qty', $qty);
+
+                // Record stock movement
+                StockMovement::create([
+                    'medicine_id' => $lot->batch->medicine_id,
+                    'batch_id' => $lot->batch_id,
+                    'stock_lot_id' => $lot->id,
+                    'location_id' => $lot->location_id,
+                    'movement_type' => 'write_off',
+                    'reference_type' => 'WriteOff',
+                    'reference_id' => $writeOff->id,
+                    'quantity_base_unit' => -$qty,
+                    'cost_per_base_unit' => $lot->cost_per_base_unit,
+                    'user_id' => $request->user()->id,
+                    'notes' => "Stock write-off {$writeOffNumber}: {$validated['reason']}",
+                    'created_at' => now(),
+                ]);
+
+                \App\Models\AuditEvent::log(
+                    'stock_written_off',
+                    'WriteOff',
+                    $writeOff->id,
+                    null,
+                    ['total_loss_paisa' => $lossPaisa, 'type' => $validated['type'], 'reason' => $validated['reason']]
+                );
+            });
+        } catch (\InvalidArgumentException $e) {
+            return back()->withErrors(['quantity' => $e->getMessage()]);
         }
 
-        $lossPaisa = (int) round($qty * ((float) $lot->cost_per_base_unit * 100));
-
-        $datePrefix = now()->format('Ymd');
-        $writeOffNumber = 'WO-' . $datePrefix . '-' . strtoupper(bin2hex(random_bytes(3)));
-
-        $writeOff = WriteOff::create([
-            'write_off_number' => $writeOffNumber,
-            'user_id' => $request->user()->id,
-            'approved_by' => $request->user()->id,
-            'total_loss_paisa' => $lossPaisa,
-            'type' => $validated['type'],
-            'reason' => $validated['reason'],
-        ]);
-
-        WriteOffLine::create([
-            'write_off_id' => $writeOff->id,
-            'stock_lot_id' => $lot->id,
-            'medicine_id' => $lot->batch->medicine_id,
-            'base_quantity' => $qty,
-            'unit_cost_paisa' => (float) $lot->cost_per_base_unit * 100,
-            'total_loss_paisa' => $lossPaisa,
-        ]);
-
-        $lot->decrement('remaining_base_qty', $qty);
-
-        // Record stock movement
-        StockMovement::create([
-            'medicine_id' => $lot->batch->medicine_id,
-            'batch_id' => $lot->batch_id,
-            'stock_lot_id' => $lot->id,
-            'location_id' => $lot->location_id,
-            'movement_type' => 'write_off',
-            'reference_type' => 'WriteOff',
-            'reference_id' => $writeOff->id,
-            'quantity_base_unit' => -$qty,
-            'cost_per_base_unit' => $lot->cost_per_base_unit,
-            'user_id' => $request->user()->id,
-            'notes' => "Stock write-off {$writeOffNumber}: {$validated['reason']}",
-            'created_at' => now(),
-        ]);
-
-        return back()->with('success', "Stock write-off {$writeOffNumber} successfully posted.");
+        return redirect()->route('inventory.index')
+            ->with('success', "Stock write-off successfully posted.");
     }
 }

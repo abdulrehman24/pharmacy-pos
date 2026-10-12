@@ -10,9 +10,22 @@ final class ThermalReceiptService
 {
     private function ascii(string $text): string
     {
-        // Strip or replace non-ASCII characters for thermal ASCII ESC/POS printing
-        $clean = preg_replace('/[^\x20-\x7E]/', '', $text);
-        return $clean ?? '';
+        // Transliterate Urdu/Arabic numerals to standard digits
+        $urduDigits = ['۰', '۱', '۲', '۳', '۴', '۵', '۶', '۷', '۸', '۹'];
+        $latinDigits = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+        $normalized = str_replace($urduDigits, $latinDigits, $text);
+
+        // Transliterate UTF-8 text if iconv is available
+        if (function_exists('iconv')) {
+            $translit = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $normalized);
+            if ($translit !== false && strlen(trim($translit)) > 0) {
+                return preg_replace('/[^\x20-\x7E]/', '', $translit) ?? '';
+            }
+        }
+
+        // Clean non-printable control characters
+        $clean = preg_replace('/[^\x20-\x7E]/', '', $normalized);
+        return $clean ?: $normalized;
     }
 
     private function money(int $paisa): string

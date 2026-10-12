@@ -21,6 +21,10 @@ class RegisteredUserController extends Controller
      */
     public function create(): Response
     {
+        if (User::exists()) {
+            abort(403, 'Public registration is disabled. Staff accounts must be created by an administrator.');
+        }
+
         return Inertia::render('Auth/Register');
     }
 
@@ -31,6 +35,10 @@ class RegisteredUserController extends Controller
      */
     public function store(Request $request): RedirectResponse
     {
+        if (User::exists()) {
+            abort(403, 'Public registration is disabled. Staff accounts must be created by an administrator.');
+        }
+
         $request->validate([
             'name' => 'required|string|max:255',
             'email' => 'required|string|lowercase|email|max:255|unique:'.User::class,
@@ -41,6 +49,8 @@ class RegisteredUserController extends Controller
             'name' => $request->name,
             'email' => $request->email,
             'password' => Hash::make($request->password),
+            'role' => 'admin',
+            'is_active' => true,
         ]);
 
         event(new Registered($user));

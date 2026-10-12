@@ -35,6 +35,7 @@ import {
     Zap,
     Check,
     Percent,
+    KeyRound,
 } from 'lucide-react';
 import { MedicineItem, MedicinePackage } from '@/types';
 
@@ -72,6 +73,7 @@ interface Props {
     counters: Array<{ id: number; name: string; code: string }>;
     customers: CustomerAccount[];
     quickMedicines?: MedicineItem[];
+    activeStaff?: Array<{ id: number; name: string; role: string }>;
     shiftStats?: {
         sales_count: number;
         sales_total_paisa: number;
@@ -109,6 +111,7 @@ export default function PosIndex({
     counters,
     customers: initialCustomers,
     quickMedicines = [],
+    activeStaff = [],
     shiftStats,
     config,
 }: Props) {
@@ -126,6 +129,7 @@ export default function PosIndex({
     const [paymentMethod, setPaymentMethod] = useState<'cash' | 'card' | 'credit' | 'jazzcash' | 'easypaisa' | 'bank_transfer'>('cash');
     const [receivedPaisa, setReceivedPaisa] = useState<number>(0);
     const [isSubmitting, setIsSubmitting] = useState(false);
+    const [checkoutIdempotencyKey, setCheckoutIdempotencyKey] = useState<string | null>(null);
     const [errorMessage, setErrorMessage] = useState<string | null>(null);
     const [heldDrawerOpen, setHeldDrawerOpen] = useState(false);
     const [soundEnabled, setSoundEnabled] = useState(true);
@@ -139,6 +143,13 @@ export default function PosIndex({
         mode: 'percent' | 'fixed';
         value: number;
     } | null>(null);
+
+    // Quick Cashier Switch states
+    const [isSwitchCashierOpen, setIsSwitchCashierOpen] = useState(false);
+    const [selectedSwitchStaff, setSelectedSwitchStaff] = useState<{ id: number; name: string; role: string } | null>(null);
+    const [switchPinCode, setSwitchPinCode] = useState('');
+    const [switchCashierError, setSwitchCashierError] = useState<string | null>(null);
+    const [isSwitchingCashier, setIsSwitchingCashier] = useState(false);
 
     const searchInputRef = useRef<HTMLInputElement>(null);
     const receivedInputRef = useRef<HTMLInputElement>(null);
@@ -202,6 +213,11 @@ export default function PosIndex({
         }
     }, []);
 
+    // Reset idempotency key whenever cart or payment parameters change
+    useEffect(() => {
+        setCheckoutIdempotencyKey(null);
+    }, [cart, invoiceDiscountPercent, invoiceDiscountFixed, selectedCustomerId, paymentMethod, receivedPaisa]);
+
     // Save held bills to localStorage
     const saveHeldBills = (bills: HeldBill[]) => {
         setHeldBills(bills);
@@ -214,9 +230,64 @@ export default function PosIndex({
         localStorage.setItem('pos_sound_pref', String(next));
     };
 
+    const handleSwitchCashierDigit = (digit: string) => {
+        if (switchPinCode.length < 4) {
+            const nextPin = switchPinCode + digit;
+            setSwitchPinCode(nextPin);
+            if (nextPin.length === 4) {
+                submitSwitchCashier(nextPin, selectedSwitchStaff?.id);
+            }
+        }
+    };
+
+    const handleSwitchCashierBackspace = () => {
+        setSwitchPinCode((prev) => prev.slice(0, -1));
+    };
+
+    const handleSwitchCashierClear = () => {
+        setSwitchPinCode('');
+    };
+
+    const submitSwitchCashier = async (pin: string, staffId?: number) => {
+        setIsSwitchingCashier(true);
+        setSwitchCashierError(null);
+        try {
+            const res = await axios.post('/pos/switch-cashier', {
+                pin_code: pin,
+                user_id: staffId || undefined,
+            });
+            if (res.data.success) {
+                playSound('success');
+                setIsSwitchCashierOpen(false);
+                setSwitchPinCode('');
+                setSelectedSwitchStaff(null);
+                router.reload();
+            }
+        } catch (err: any) {
+            playSound('error');
+            setSwitchPinCode('');
+            setSwitchCashierError(err.response?.data?.message || 'Invalid PIN code. Please try again.');
+        } finally {
+            setIsSwitchingCashier(false);
+        }
+    };
+
     // Keyboard Shortcuts (F1, F2, F4, F8, F9, ESC)
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
+            if (isSwitchCashierOpen) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    setIsSwitchCashierOpen(false);
+                } else if (/^[0-9]$/.test(e.key)) {
+                    e.preventDefault();
+                    handleSwitchCashierDigit(e.key);
+                } else if (e.key === 'Backspace') {
+                    e.preventDefault();
+                    handleSwitchCashierBackspace();
+                }
+                return;
+            }
             if (e.key === 'F2') {
                 e.preventDefault();
                 searchInputRef.current?.focus();
@@ -248,7 +319,7 @@ export default function PosIndex({
 
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [cart, isPaymentOpen, heldDrawerOpen, isNewCustomerOpen, lineDiscountModal]);
+    }, [cart, isPaymentOpen, heldDrawerOpen, isNewCustomerOpen, lineDiscountModal, isSwitchCashierOpen, selectedSwitchStaff, switchPinCode]);
 
     // Live Debounced Medicine & Barcode Search
     useEffect(() => {
@@ -561,7 +632,10 @@ export default function PosIndex({
         setErrorMessage(null);
         setIsSubmitting(true);
 
-        const idempotencyKey = 'pos_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+        const idempotencyKey = checkoutIdempotencyKey || ('pos_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9));
+        if (!checkoutIdempotencyKey) {
+            setCheckoutIdempotencyKey(idempotencyKey);
+        }
 
         const payload = {
             idempotency_key: idempotencyKey,
@@ -584,6 +658,7 @@ export default function PosIndex({
             const res = await axios.post(route('pos.checkout'), payload);
             if (res.data.success) {
                 playSound('success');
+                setCheckoutIdempotencyKey(null);
                 setCart([]);
                 setInvoiceDiscountPercent(0);
                 setInvoiceDiscountFixed(0);
@@ -636,9 +711,25 @@ export default function PosIndex({
 
                     <span className="text-slate-700 hidden sm:inline">|</span>
 
-                    <div className="text-xs text-slate-300 hidden sm:flex items-center gap-1.5">
+                    <div className="text-xs text-slate-300 hidden sm:flex items-center gap-1.5 bg-slate-950/60 px-2.5 py-1 rounded-lg border border-slate-800/80">
                         <span className="text-slate-500">Cashier:</span>
-                        <span className="font-semibold text-slate-200">{currentShift?.user?.name ?? 'Active Shift'}</span>
+                        <span className="font-semibold text-emerald-300">{currentShift?.user?.name ?? 'Active Shift'}</span>
+                        {activeStaff && activeStaff.length > 0 && (
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setIsSwitchCashierOpen(true);
+                                    setSelectedSwitchStaff(null);
+                                    setSwitchPinCode('');
+                                    setSwitchCashierError(null);
+                                }}
+                                className="ml-1 text-[10px] uppercase font-bold tracking-wider bg-emerald-950/60 text-emerald-400 hover:bg-emerald-900/80 border border-emerald-500/30 px-1.5 py-0.5 rounded transition flex items-center gap-1"
+                                title="Quick Cashier Switch (4-Digit PIN)"
+                            >
+                                <KeyRound className="h-2.5 w-2.5" />
+                                <span>Switch</span>
+                            </button>
+                        )}
                     </div>
 
                     {shiftStats && (
@@ -1735,6 +1826,157 @@ export default function PosIndex({
                                 ))
                             )}
                         </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Quick Cashier Switch Modal (4-Digit PIN) */}
+            {isSwitchCashierOpen && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-md p-4 animate-in fade-in duration-200">
+                    <div className="w-full max-w-md rounded-3xl border border-slate-800 bg-slate-900/95 p-6 shadow-2xl backdrop-blur-xl">
+                        <div className="flex items-center justify-between pb-4 border-b border-slate-800">
+                            <div className="flex items-center gap-3">
+                                <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                                    <KeyRound className="h-5 w-5" />
+                                </div>
+                                <div>
+                                    <h3 className="font-bold text-white text-base">Quick Cashier Switch</h3>
+                                    <p className="text-xs text-slate-400">Switch terminal operator with 4-digit PIN</p>
+                                </div>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setIsSwitchCashierOpen(false);
+                                    setSwitchPinCode('');
+                                    setSelectedSwitchStaff(null);
+                                    setSwitchCashierError(null);
+                                }}
+                                className="rounded-xl p-2 text-slate-400 hover:bg-slate-800 hover:text-white transition"
+                            >
+                                <X className="h-5 w-5" />
+                            </button>
+                        </div>
+
+                        {switchCashierError && (
+                            <div className="mt-4 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-300 flex items-center gap-2">
+                                <AlertCircle className="h-4 w-4 shrink-0 text-rose-400" />
+                                <span>{switchCashierError}</span>
+                            </div>
+                        )}
+
+                        {!selectedSwitchStaff ? (
+                            <div className="mt-4 space-y-3">
+                                <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                                    Select Cashier / Staff Member
+                                </div>
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-64 overflow-y-auto pr-1">
+                                    {activeStaff.map((staff) => (
+                                        <button
+                                            key={staff.id}
+                                            type="button"
+                                            onClick={() => {
+                                                setSelectedSwitchStaff(staff);
+                                                setSwitchPinCode('');
+                                                setSwitchCashierError(null);
+                                            }}
+                                            className="flex flex-col items-start p-3 rounded-2xl border border-slate-800 bg-slate-950/60 hover:bg-emerald-500/10 hover:border-emerald-500/30 text-left transition group"
+                                        >
+                                            <div className="font-bold text-slate-200 text-sm group-hover:text-emerald-300">
+                                                {staff.name}
+                                            </div>
+                                            <div className="mt-1 flex items-center gap-1.5">
+                                                <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
+                                                    {staff.role}
+                                                </span>
+                                            </div>
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                        ) : (
+                            <div className="mt-4 space-y-4">
+                                <div className="flex items-center justify-between bg-slate-950/60 p-3 rounded-2xl border border-slate-800">
+                                    <div className="flex items-center gap-2.5">
+                                        <div className="h-8 w-8 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 flex items-center justify-center font-bold text-xs">
+                                            {selectedSwitchStaff.name.slice(0, 2).toUpperCase()}
+                                        </div>
+                                        <div>
+                                            <div className="font-bold text-slate-200 text-sm">{selectedSwitchStaff.name}</div>
+                                            <div className="text-[10px] text-slate-400 uppercase tracking-wider">{selectedSwitchStaff.role}</div>
+                                        </div>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            setSelectedSwitchStaff(null);
+                                            setSwitchPinCode('');
+                                            setSwitchCashierError(null);
+                                        }}
+                                        className="text-xs text-slate-400 hover:text-white px-2 py-1 rounded-lg hover:bg-slate-800 transition"
+                                    >
+                                        Change Staff
+                                    </button>
+                                </div>
+
+                                {/* PIN Dots */}
+                                <div className="flex justify-center items-center gap-4 py-3 bg-slate-950/40 rounded-2xl border border-slate-800/60">
+                                    {[0, 1, 2, 3].map((idx) => (
+                                        <div
+                                            key={idx}
+                                            className={`h-4 w-4 rounded-full border-2 transition-all duration-200 ${
+                                                switchPinCode.length > idx
+                                                    ? 'bg-emerald-400 border-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.6)] scale-110'
+                                                    : 'border-slate-700 bg-slate-950'
+                                            }`}
+                                        />
+                                    ))}
+                                </div>
+
+                                {/* Keypad */}
+                                <div className="grid grid-cols-3 gap-2">
+                                    {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map((digit) => (
+                                        <button
+                                            key={digit}
+                                            type="button"
+                                            disabled={isSwitchingCashier}
+                                            onClick={() => handleSwitchCashierDigit(digit)}
+                                            className="h-12 rounded-xl bg-slate-800/80 hover:bg-slate-700 active:bg-emerald-600 font-bold text-lg text-white border border-slate-700/60 transition disabled:opacity-50"
+                                        >
+                                            {digit}
+                                        </button>
+                                    ))}
+                                    <button
+                                        type="button"
+                                        disabled={isSwitchingCashier || switchPinCode.length === 0}
+                                        onClick={handleSwitchCashierClear}
+                                        className="h-12 rounded-xl bg-slate-800/40 hover:bg-rose-500/20 text-xs font-semibold text-slate-400 hover:text-rose-300 border border-slate-800 transition disabled:opacity-30"
+                                    >
+                                        Clear
+                                    </button>
+                                    <button
+                                        type="button"
+                                        disabled={isSwitchingCashier}
+                                        onClick={() => handleSwitchCashierDigit('0')}
+                                        className="h-12 rounded-xl bg-slate-800/80 hover:bg-slate-700 active:bg-emerald-600 font-bold text-lg text-white border border-slate-700/60 transition disabled:opacity-50"
+                                    >
+                                        0
+                                    </button>
+                                    <button
+                                        type="button"
+                                        disabled={isSwitchingCashier || switchPinCode.length === 0}
+                                        onClick={handleSwitchCashierBackspace}
+                                        className="h-12 rounded-xl bg-slate-800/40 hover:bg-slate-700 text-xs font-semibold text-slate-400 hover:text-white border border-slate-800 transition disabled:opacity-30"
+                                    >
+                                        ⌫ Back
+                                    </button>
+                                </div>
+
+                                <div className="text-center text-[11px] text-slate-500">
+                                    Numpad or physical keyboard supported
+                                </div>
+                            </div>
+                        )}
                     </div>
                 </div>
             )}

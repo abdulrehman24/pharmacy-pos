@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Actions\Sales\FinalizeSale;
+use App\Models\AuditEvent;
 use App\Models\Counter;
 use App\Models\Customer;
 use App\Models\Medicine;
@@ -10,9 +11,12 @@ use App\Models\MedicineBarcode;
 use App\Models\Sale;
 use App\Models\Setting;
 use App\Models\Shift;
+use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\RateLimiter;
 use Inertia\Inertia;
 use Inertia\Response;
 
@@ -26,19 +30,12 @@ class PosController extends Controller
     {
         $user = $request->user();
 
-        // Check if there is an active shift for this user or counter
+        // Check if there is an active shift strictly for this user
         $currentShift = Shift::with('counter')
             ->where('status', 'open')
-            ->where(function ($q) use ($user) {
-                $q->where('user_id', $user->id);
-            })
+            ->where('user_id', $user->id)
             ->latest()
             ->first();
-
-        // If no shift is open for current user, check if any open shift exists on counter
-        if (!$currentShift) {
-            $currentShift = Shift::with('counter')->where('status', 'open')->latest()->first();
-        }
 
         $counters = Counter::where('is_active', true)->get();
         $customers = Customer::where('is_active', true)
@@ -86,6 +83,12 @@ class PosController extends Controller
             'counters' => $counters,
             'customers' => $customers,
             'quickMedicines' => $quickMedicines,
+            'activeStaff' => User::where('is_active', true)
+                ->whereNotNull('pin_code')
+                ->where('pin_code', '!=', '')
+                ->select('id', 'name', 'role')
+                ->orderBy('name')
+                ->get(),
             'shiftStats' => [
                 'sales_count' => $shiftSalesCount,
                 'sales_total_paisa' => $shiftSalesTotalPaisa,
@@ -195,9 +198,28 @@ class PosController extends Controller
             'payment_method' => ['required', 'string', 'in:cash,card,jazzcash,easypaisa,bank_transfer,credit'],
             'received_paisa' => ['nullable', 'integer', 'min:0'],
             'notes' => ['nullable', 'string', 'max:500'],
+            'prescription_id' => ['nullable', 'integer', 'exists:prescriptions,id'],
         ]);
 
-        $sale = $this->finalizeSale->execute($validated, $request->user());
+        try {
+            $sale = $this->finalizeSale->execute($validated, $request->user());
+        } catch (\Symfony\Component\HttpKernel\Exception\ConflictHttpException $e) {
+            if ($request->wantsJson()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => $e->getMessage(),
+                ], 409);
+            }
+            throw $e;
+        } catch (\InvalidArgumentException|\RuntimeException $e) {
+            if ($request->wantsJson()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => $e->getMessage(),
+                ], 422);
+            }
+            return back()->withErrors(['checkout' => $e->getMessage()]);
+        }
 
         if ($request->wantsJson()) {
             return response()->json([
@@ -208,5 +230,73 @@ class PosController extends Controller
         }
 
         return redirect()->route('sales.receipt', $sale->id);
+    }
+
+    /**
+     * Quick Cashier Switch via PIN code at POS terminal
+     */
+    public function switchCashier(Request $request): JsonResponse
+    {
+        $request->validate([
+            'pin_code' => ['required', 'string', 'max:10'],
+            'user_id' => ['nullable', 'exists:users,id'],
+        ]);
+
+        $throttleKey = 'pin_switch|' . $request->ip();
+        if (RateLimiter::tooManyAttempts($throttleKey, 5)) {
+            $seconds = RateLimiter::availableIn($throttleKey);
+            return response()->json([
+                'success' => false,
+                'message' => "Too many PIN attempts. Please wait {$seconds} seconds.",
+            ], 429);
+        }
+
+        $targetUser = null;
+        if ($request->filled('user_id')) {
+            $user = User::where('id', $request->user_id)->where('is_active', true)->first();
+            if ($user && !empty($user->pin_code) && hash_equals((string) $user->pin_code, (string) $request->pin_code)) {
+                $targetUser = $user;
+            }
+        } else {
+            // Direct 4-digit PIN lookup across active users
+            $matches = User::where('is_active', true)
+                ->where('pin_code', (string) $request->pin_code)
+                ->get();
+            if ($matches->count() === 1) {
+                $targetUser = $matches->first();
+            }
+        }
+
+        if (!$targetUser) {
+            RateLimiter::hit($throttleKey, 60);
+            return response()->json([
+                'success' => false,
+                'message' => 'Invalid PIN code. Cashier not verified.',
+            ], 422);
+        }
+
+        RateLimiter::clear($throttleKey);
+
+        $previousUser = $request->user();
+        Auth::login($targetUser);
+        $request->session()->regenerate();
+
+        AuditEvent::log(
+            'cashier_switched',
+            'User',
+            $targetUser->id,
+            ['previous_user_id' => $previousUser?->id, 'previous_user' => $previousUser?->name],
+            ['new_user_id' => $targetUser->id, 'new_user' => $targetUser->name]
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => "Switched active cashier to {$targetUser->name}.",
+            'user' => [
+                'id' => $targetUser->id,
+                'name' => $targetUser->name,
+                'role' => $targetUser->role,
+            ],
+        ]);
     }
 }

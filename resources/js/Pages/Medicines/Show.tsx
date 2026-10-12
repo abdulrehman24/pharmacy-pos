@@ -1,6 +1,6 @@
 import AuthenticatedLayout from '@/Layouts/AuthenticatedLayout';
 import { Head, Link } from '@inertiajs/react';
-import { Pill, ArrowLeft, Boxes, History } from 'lucide-react';
+import { Pill, ArrowLeft, Boxes, History, Edit, Archive } from 'lucide-react';
 
 interface Props {
     medicine: any;
@@ -16,21 +16,45 @@ export default function MedicinesShow({ medicine, total_stock_base, recentMoveme
     return (
         <AuthenticatedLayout
             header={
-                <div className="flex items-center gap-4">
-                    <Link
-                        href={route('medicines.index')}
-                        className="rounded-xl bg-slate-800 p-2 text-slate-400 hover:text-white"
-                    >
-                        <ArrowLeft className="h-5 w-5" />
-                    </Link>
-                    <div>
-                        <h1 className="text-2xl font-bold tracking-tight text-white flex items-center gap-2">
-                            <Pill className="h-6 w-6 text-emerald-400" />
-                            {medicine.brand_name} {medicine.strength}
-                        </h1>
-                        <p className="text-sm text-slate-400">
-                            {medicine.generic_name} • Code: {medicine.code}
-                        </p>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                    <div className="flex items-center gap-4">
+                        <Link
+                            href={route('medicines.index')}
+                            className="rounded-xl bg-slate-800 p-2 text-slate-400 hover:text-white"
+                        >
+                            <ArrowLeft className="h-5 w-5" />
+                        </Link>
+                        <div>
+                            <h1 className="text-2xl font-bold tracking-tight text-white flex items-center gap-2">
+                                <Pill className="h-6 w-6 text-emerald-400" />
+                                {medicine.brand_name} {medicine.strength}
+                            </h1>
+                            <p className="text-sm text-slate-400">
+                                {medicine.generic_name} • Code: {medicine.code}
+                            </p>
+                        </div>
+                    </div>
+                    <div className="flex items-center gap-3">
+                        <Link
+                            href={route('medicines.edit', medicine.id)}
+                            className="inline-flex items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-800 px-4 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-700 hover:text-white transition"
+                        >
+                            <Edit className="h-3.5 w-3.5" />
+                            <span>Edit Profile</span>
+                        </Link>
+                        <Link
+                            href={route('medicines.toggle-status', medicine.id)}
+                            method="post"
+                            as="button"
+                            className={`inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-semibold transition ${
+                                medicine.is_active
+                                    ? 'border border-rose-500/30 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20'
+                                    : 'border border-emerald-500/30 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'
+                            }`}
+                        >
+                            <Archive className="h-3.5 w-3.5" />
+                            <span>{medicine.is_active ? 'Archive Medicine' : 'Activate Medicine'}</span>
+                        </Link>
                     </div>
                 </div>
             }

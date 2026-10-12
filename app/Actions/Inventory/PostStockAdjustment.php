@@ -13,46 +13,54 @@ class PostStockAdjustment
 {
     public function execute(StockCount $stockCount, User $approver): StockCount
     {
-        if ($stockCount->status !== 'draft') {
-            throw new InvalidArgumentException("Only draft stock counts can be approved.");
-        }
-
         return DB::transaction(function () use ($stockCount, $approver) {
-            foreach ($stockCount->lines as $line) {
+            $lockedCount = StockCount::with('lines')->where('id', $stockCount->id)->lockForUpdate()->firstOrFail();
+
+            if ($lockedCount->status !== 'draft') {
+                throw new InvalidArgumentException("Only draft stock counts can be approved.");
+            }
+
+            foreach ($lockedCount->lines as $line) {
                 if ($line->variance_quantity == 0) {
                     continue;
                 }
 
-                $lot = StockLot::findOrFail($line->stock_lot_id);
+                $lot = StockLot::where('id', $line->stock_lot_id)->lockForUpdate()->firstOrFail();
 
-                // Update physical stock balance
-                $newQty = max(0, $lot->remaining_base_qty + $line->variance_quantity);
+                $originalQty = (int) $lot->remaining_base_qty;
+                // Physical stock balance clamped at 0
+                $newQty = max(0, $originalQty + (int) $line->variance_quantity);
                 $lot->remaining_base_qty = $newQty;
                 $lot->save();
 
-                // Record stock movement
-                StockMovement::create([
-                    'medicine_id' => $line->medicine_id,
-                    'batch_id' => $line->batch_id,
-                    'stock_lot_id' => $line->stock_lot_id,
-                    'location_id' => $stockCount->location_id,
-                    'movement_type' => 'adjustment',
-                    'reference_type' => 'StockCount',
-                    'reference_id' => $stockCount->id,
-                    'quantity_base_unit' => $line->variance_quantity,
-                    'cost_per_base_unit' => $line->cost_per_base_unit,
-                    'user_id' => $approver->id,
-                    'notes' => "Stock adjustment count {$stockCount->count_number}. Reason: {$line->reason}",
-                    'created_at' => now(),
-                ]);
+                // Actual applied movement delta (matches exact change to stock balance)
+                $appliedMovementDelta = $newQty - $originalQty;
+
+                if ($appliedMovementDelta !== 0) {
+                    // Record stock movement
+                    StockMovement::create([
+                        'medicine_id' => $line->medicine_id,
+                        'batch_id' => $line->batch_id,
+                        'stock_lot_id' => $line->stock_lot_id,
+                        'location_id' => $lockedCount->location_id,
+                        'movement_type' => 'adjustment',
+                        'reference_type' => 'StockCount',
+                        'reference_id' => $lockedCount->id,
+                        'quantity_base_unit' => $appliedMovementDelta,
+                        'cost_per_base_unit' => $line->cost_per_base_unit,
+                        'user_id' => $approver->id,
+                        'notes' => "Stock adjustment count {$lockedCount->count_number}. Reason: {$line->reason}",
+                        'created_at' => now(),
+                    ]);
+                }
             }
 
-            $stockCount->status = 'approved';
-            $stockCount->approved_by = $approver->id;
-            $stockCount->approved_at = now();
-            $stockCount->save();
+            $lockedCount->status = 'approved';
+            $lockedCount->approved_by = $approver->id;
+            $lockedCount->approved_at = now();
+            $lockedCount->save();
 
-            return $stockCount;
+            return $lockedCount;
         });
     }
 }

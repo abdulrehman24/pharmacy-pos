@@ -29,6 +29,7 @@ Route::middleware('auth')->group(function () {
     Route::get('/pos', [PosController::class, 'index'])->name('pos.index');
     Route::get('/pos/search', [PosController::class, 'search'])->name('pos.search');
     Route::post('/pos/checkout', [PosController::class, 'checkout'])->name('pos.checkout');
+    Route::post('/pos/switch-cashier', [PosController::class, 'switchCashier'])->name('pos.switch-cashier');
 
     // Thermal & Browser Receipts
     Route::get('/sales/{sale}/receipt', [ReceiptController::class, 'show'])->name('sales.receipt');
@@ -39,7 +40,8 @@ Route::middleware('auth')->group(function () {
     Route::delete('/categories/{category}', [MedicineController::class, 'destroyCategory'])->name('categories.destroy');
     Route::post('/manufacturers/quick-store', [MedicineController::class, 'storeManufacturer'])->name('manufacturers.quick-store');
     Route::delete('/manufacturers/{manufacturer}', [MedicineController::class, 'destroyManufacturer'])->name('manufacturers.destroy');
-    Route::resource('medicines', MedicineController::class)->only(['index', 'create', 'store', 'show']);
+    Route::resource('medicines', MedicineController::class)->only(['index', 'create', 'store', 'show', 'edit', 'update']);
+    Route::post('/medicines/{medicine}/toggle-status', [MedicineController::class, 'toggleStatus'])->name('medicines.toggle-status');
 
     // Purchases & Receiving
     Route::resource('purchases', PurchaseController::class)->only(['index', 'create', 'store', 'show']);
@@ -49,8 +51,6 @@ Route::middleware('auth')->group(function () {
     Route::get('/inventory/ledger', [InventoryController::class, 'ledger'])->name('inventory.ledger');
     Route::get('/inventory/counts', [InventoryController::class, 'counts'])->name('inventory.counts');
     Route::post('/inventory/counts', [InventoryController::class, 'storeCount'])->name('inventory.counts.store');
-    Route::post('/inventory/counts/{stockCount}/approve', [InventoryController::class, 'approveCount'])->name('inventory.counts.approve');
-    Route::post('/inventory/write-off', [InventoryController::class, 'writeOff'])->name('inventory.write-off');
 
     // Suppliers & Supplier Payments
     Route::resource('suppliers', SupplierController::class)->only(['index', 'store', 'show']);
@@ -66,6 +66,7 @@ Route::middleware('auth')->group(function () {
     Route::get('/returns/search-invoice', [ReturnController::class, 'searchInvoice'])->name('returns.search-invoice');
     Route::post('/returns/customer', [ReturnController::class, 'storeCustomerReturn'])->name('returns.customer.store');
     Route::post('/returns/supplier', [ReturnController::class, 'storeSupplierReturn'])->name('returns.supplier.store');
+    Route::post('/returns/supplier/{supplierReturn}/confirm-credit', [ReturnController::class, 'confirmSupplierCredit'])->name('returns.supplier.confirm-credit');
 
     // Cashier Shifts & Operating Expenses
     Route::get('/shifts', [ShiftController::class, 'index'])->name('shifts.index');
@@ -75,27 +76,40 @@ Route::middleware('auth')->group(function () {
     Route::get('/expenses', [ExpenseController::class, 'index'])->name('expenses.index');
     Route::post('/expenses', [ExpenseController::class, 'store'])->name('expenses.store');
 
-    // Reports & Exports
-    Route::get('/reports', [ReportController::class, 'index'])->name('reports.index');
-    Route::get('/reports/export-sales', [ReportController::class, 'exportSalesCsv'])->name('reports.export-sales');
-    Route::get('/reports/export-stock', [ReportController::class, 'exportStockCsv'])->name('reports.export-stock');
+    // Reports & Exports (Admin & Manager)
+    Route::middleware('role:admin,manager')->group(function () {
+        Route::get('/reports', [ReportController::class, 'index'])->name('reports.index');
+        Route::get('/reports/export-sales', [ReportController::class, 'exportSalesCsv'])->name('reports.export-sales');
+        Route::get('/reports/export-stock', [ReportController::class, 'exportStockCsv'])->name('reports.export-stock');
+        Route::post('/inventory/counts/{stockCount}/approve', [InventoryController::class, 'approveCount'])->name('inventory.counts.approve');
+        Route::post('/inventory/write-off', [InventoryController::class, 'writeOff'])->name('inventory.write-off');
+    });
 
     // Prescriptions & Dispensing Records
     Route::get('/prescriptions', [PrescriptionController::class, 'index'])->name('prescriptions.index');
     Route::post('/prescriptions', [PrescriptionController::class, 'store'])->name('prescriptions.store');
-    Route::post('/prescriptions/{prescription}/verify', [PrescriptionController::class, 'verify'])->name('prescriptions.verify');
+    Route::post('/prescriptions/{prescription}/verify', [PrescriptionController::class, 'verify'])
+        ->middleware('role:admin,manager,pharmacist')
+        ->name('prescriptions.verify');
+    Route::get('/prescriptions/attachment/{attachment}/download', [PrescriptionController::class, 'downloadAttachment'])
+        ->middleware('role:admin,manager,pharmacist')
+        ->name('prescriptions.attachment.download');
 
-    // Settings, Hardware Profiles, Backups & Users
-    Route::get('/settings', [SettingController::class, 'index'])->name('settings.index');
-    Route::post('/settings', [SettingController::class, 'update'])->name('settings.update');
-    Route::post('/settings/printer', [SettingController::class, 'storePrinter'])->name('settings.printer.store');
-    Route::post('/settings/user', [SettingController::class, 'storeUser'])->name('settings.user.store');
-    Route::post('/settings/backup', [SettingController::class, 'createBackup'])->name('settings.backup.create');
-    Route::get('/settings/backup/{backupRun}/download', [SettingController::class, 'downloadBackup'])->name('settings.backup.download');
+    // Settings, Hardware Profiles, Backups & Users (Admin only)
+    Route::middleware('role:admin')->group(function () {
+        Route::get('/settings', [SettingController::class, 'index'])->name('settings.index');
+        Route::post('/settings', [SettingController::class, 'update'])->name('settings.update');
+        Route::post('/settings/printer', [SettingController::class, 'storePrinter'])->name('settings.printer.store');
+        Route::post('/settings/user', [SettingController::class, 'storeUser'])->name('settings.user.store');
+        Route::post('/settings/backup', [SettingController::class, 'createBackup'])->name('settings.backup.create');
+        Route::get('/settings/backup/{backupRun}/download', [SettingController::class, 'downloadBackup'])->name('settings.backup.download');
+        Route::post('/settings/backup/restore', [SettingController::class, 'restoreBackup'])->name('settings.backup.restore');
+    });
 
-    // User Profile
+    // User Profile & Account Settings
     Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
     Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');
+    Route::put('/profile/pin', [ProfileController::class, 'updatePin'])->name('profile.pin.update');
     Route::delete('/profile', [ProfileController::class, 'destroy'])->name('profile.destroy');
 });
 

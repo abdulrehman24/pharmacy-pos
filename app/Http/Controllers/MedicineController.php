@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\AuditEvent;
 use App\Models\Category;
 use App\Models\Manufacturer;
 use App\Models\Medicine;
@@ -10,6 +11,7 @@ use App\Models\MedicinePackage;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Inertia\Inertia;
 use Inertia\Response;
@@ -66,6 +68,18 @@ class MedicineController extends Controller
 
     public function store(Request $request): RedirectResponse
     {
+        // Pre-normalize incoming package barcodes (trim whitespace before validation)
+        if ($request->has('packages') && is_array($request->input('packages'))) {
+            $pkgs = $request->input('packages');
+            foreach ($pkgs as $idx => $p) {
+                if (isset($p['barcode']) && is_string($p['barcode'])) {
+                    $trimmed = trim($p['barcode']);
+                    $pkgs[$idx]['barcode'] = $trimmed !== '' ? $trimmed : null;
+                }
+            }
+            $request->merge(['packages' => $pkgs]);
+        }
+
         $validated = $request->validate([
             'code' => ['required', 'string', 'max:30', 'unique:medicines,code'],
             'brand_name' => ['required', 'string', 'max:255'],
@@ -78,53 +92,142 @@ class MedicineController extends Controller
             'rack_shelf' => ['nullable', 'string', 'max:50'],
             'reorder_level' => ['required', 'integer', 'min:0'],
             'prescription_required' => ['boolean'],
+            'is_narcotic' => ['boolean'],
             'notes' => ['nullable', 'string', 'max:500'],
             'packages' => ['required', 'array', 'min:1'],
             'packages.*.name' => ['required', 'string', 'max:50'],
             'packages.*.base_quantity' => ['required', 'integer', 'min:1'],
             'packages.*.default_sell_price_paisa' => ['required', 'integer', 'min:0'],
             'packages.*.default_purchase_price_paisa' => ['nullable', 'integer', 'min:0'],
-            'packages.*.barcode' => ['nullable', 'string', 'max:100', 'unique:medicine_barcodes,barcode'],
+            'packages.*.barcode' => ['nullable', 'string', 'max:100', 'distinct', 'unique:medicine_barcodes,barcode'],
             'packages.*.is_default_sale' => ['boolean'],
         ]);
 
-        $medicine = Medicine::create([
-            'code' => $validated['code'],
-            'brand_name' => $validated['brand_name'],
-            'generic_name' => $validated['generic_name'],
-            'strength' => $validated['strength'],
-            'dosage_form' => $validated['dosage_form'],
-            'category_id' => $validated['category_id'],
-            'manufacturer_id' => $validated['manufacturer_id'],
-            'base_unit' => $validated['base_unit'],
-            'rack_shelf' => $validated['rack_shelf'],
-            'reorder_level' => $validated['reorder_level'],
-            'prescription_required' => $validated['prescription_required'] ?? false,
-            'is_active' => true,
-            'notes' => $validated['notes'],
-        ]);
-
-        foreach ($validated['packages'] as $pkg) {
-            $package = MedicinePackage::create([
-                'medicine_id' => $medicine->id,
-                'name' => $pkg['name'],
-                'base_quantity' => $pkg['base_quantity'],
-                'default_sell_price_paisa' => $pkg['default_sell_price_paisa'],
-                'default_purchase_price_paisa' => $pkg['default_purchase_price_paisa'] ?? 0,
-                'is_default_sale' => $pkg['is_default_sale'] ?? false,
+        $medicine = DB::transaction(function () use ($validated) {
+            $med = Medicine::create([
+                'code' => $validated['code'],
+                'brand_name' => $validated['brand_name'],
+                'generic_name' => $validated['generic_name'] ?? null,
+                'strength' => $validated['strength'] ?? null,
+                'dosage_form' => $validated['dosage_form'],
+                'category_id' => $validated['category_id'] ?? null,
+                'manufacturer_id' => $validated['manufacturer_id'] ?? null,
+                'base_unit' => $validated['base_unit'],
+                'rack_shelf' => $validated['rack_shelf'] ?? null,
+                'reorder_level' => $validated['reorder_level'] ?? 0,
+                'prescription_required' => $validated['prescription_required'] ?? false,
+                'is_narcotic' => $validated['is_narcotic'] ?? false,
+                'is_active' => true,
+                'notes' => $validated['notes'] ?? null,
             ]);
 
-            if (!empty($pkg['barcode'])) {
-                MedicineBarcode::create([
-                    'medicine_id' => $medicine->id,
-                    'medicine_package_id' => $package->id,
-                    'barcode' => trim($pkg['barcode']),
+            foreach ($validated['packages'] as $idx => $pkg) {
+                $isDefault = $pkg['is_default_sale'] ?? ($idx === 0);
+                $package = MedicinePackage::create([
+                    'medicine_id' => $med->id,
+                    'name' => $pkg['name'],
+                    'base_quantity' => $pkg['base_quantity'],
+                    'default_sell_price_paisa' => $pkg['default_sell_price_paisa'],
+                    'default_purchase_price_paisa' => $pkg['default_purchase_price_paisa'] ?? 0,
+                    'is_default_sale' => $isDefault,
                 ]);
+
+                $barcode = isset($pkg['barcode']) && strlen(trim($pkg['barcode'])) > 0 ? trim($pkg['barcode']) : null;
+                if ($barcode) {
+                    MedicineBarcode::create([
+                        'medicine_id' => $med->id,
+                        'medicine_package_id' => $package->id,
+                        'barcode' => $barcode,
+                    ]);
+                }
             }
-        }
+
+            AuditEvent::log(
+                'medicine_created',
+                'Medicine',
+                $med->id,
+                null,
+                ['code' => $med->code, 'brand_name' => $med->brand_name]
+            );
+
+            return $med;
+        });
 
         return redirect()->route('medicines.index')
             ->with('success', "Medicine '{$medicine->brand_name}' created successfully.");
+    }
+
+    public function edit(Medicine $medicine): Response
+    {
+        $medicine->load(['category', 'manufacturer', 'packages.barcodes']);
+
+        return Inertia::render('Medicines/Edit', [
+            'medicine' => $medicine,
+            'categories' => Category::all(),
+            'manufacturers' => Manufacturer::all(),
+        ]);
+    }
+
+    public function update(Request $request, Medicine $medicine): RedirectResponse
+    {
+        $validated = $request->validate([
+            'brand_name' => ['required', 'string', 'max:255'],
+            'generic_name' => ['nullable', 'string', 'max:255'],
+            'strength' => ['nullable', 'string', 'max:50'],
+            'dosage_form' => ['required', 'string', 'max:50'],
+            'category_id' => ['nullable', 'exists:categories,id'],
+            'manufacturer_id' => ['nullable', 'exists:manufacturers,id'],
+            'base_unit' => ['required', 'string', 'max:30'],
+            'rack_shelf' => ['nullable', 'string', 'max:50'],
+            'reorder_level' => ['required', 'integer', 'min:0'],
+            'prescription_required' => ['boolean'],
+            'is_narcotic' => ['boolean'],
+            'notes' => ['nullable', 'string', 'max:500'],
+        ]);
+
+        $medicine->update([
+            'brand_name' => $validated['brand_name'],
+            'generic_name' => $validated['generic_name'] ?? null,
+            'strength' => $validated['strength'] ?? null,
+            'dosage_form' => $validated['dosage_form'],
+            'category_id' => $validated['category_id'] ?? null,
+            'manufacturer_id' => $validated['manufacturer_id'] ?? null,
+            'base_unit' => $validated['base_unit'],
+            'rack_shelf' => $validated['rack_shelf'] ?? null,
+            'reorder_level' => $validated['reorder_level'] ?? 0,
+            'prescription_required' => $validated['prescription_required'] ?? false,
+            'is_narcotic' => $validated['is_narcotic'] ?? false,
+            'notes' => $validated['notes'] ?? null,
+        ]);
+
+        AuditEvent::log(
+            'medicine_updated',
+            'Medicine',
+            $medicine->id,
+            null,
+            ['code' => $medicine->code, 'brand_name' => $medicine->brand_name]
+        );
+
+        return redirect()->route('medicines.show', $medicine)
+            ->with('success', "Medicine '{$medicine->brand_name}' updated successfully.");
+    }
+
+    public function toggleStatus(Medicine $medicine): RedirectResponse
+    {
+        $oldStatus = $medicine->is_active;
+        $medicine->is_active = !$medicine->is_active;
+        $medicine->save();
+
+        AuditEvent::log(
+            'medicine_status_toggled',
+            'Medicine',
+            $medicine->id,
+            ['is_active' => $oldStatus],
+            ['is_active' => $medicine->is_active]
+        );
+
+        $action = $medicine->is_active ? 'activated' : 'archived';
+        return back()->with('success', "Medicine '{$medicine->brand_name}' {$action}.");
     }
 
     public function show(Medicine $medicine): Response

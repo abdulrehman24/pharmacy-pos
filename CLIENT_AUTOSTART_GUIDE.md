@@ -11,7 +11,7 @@ Your client gets a standard desktop icon labeled **"Pharmacy POS"** on their Win
 ### What happens when the client double-clicks the icon:
 1. It silently checks if the background server is already running.
 2. If not running, it **starts the server silently in the background** (no black command prompt or terminal window flashes on screen).
-3. It opens **Google Chrome or Edge in App Mode** (`--app=http://localhost:8000/pos`), which displays the POS as a **clean, native desktop window** with no browser tabs, search bar, or address bar.
+3. It opens **Google Chrome or Edge in App Mode** (`--app=http://localhost:8080/pos`), which displays the POS as a **clean, native desktop window** with no browser tabs, search bar, or address bar.
 
 ### How to set it up for your client:
 1. Open the project folder on the client's PC.

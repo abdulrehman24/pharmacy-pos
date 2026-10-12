@@ -12,6 +12,7 @@ class Sale extends Model
     protected $fillable = [
         'invoice_number',
         'idempotency_key',
+        'payload_hash',
         'shift_id',
         'counter_id',
         'cashier_id',
